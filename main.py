@@ -7,11 +7,12 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins = ["http://localhost:3000","https://chapter1-menu-lppv.vercel.app" ],             
+    allow_origins = ["http://localhost:3000","https://chapter1-menu-lppv.vercel.app","https://chapter1-frontend-lppv.vercel.app", ],             
     allow_methods=["*"],
     allow_headers=["*"])
 
 @app.get("/menu")  #"Go to menu_items table, get everything, give it back to me."
+
 def get_menu():
     response = supabase.table("menu_items").select("*").execute() #giving an sql comment to supabse to display all the items in menu_items table
     return response.data  # returning the response to the frontend
