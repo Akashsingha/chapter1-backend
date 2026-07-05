@@ -2,14 +2,18 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from database import supabase #importing supabse variable which is the return of client id (url,api)
 from fastapi.middleware.cors import CORSMiddleware # it allows communication between teo different port 3000(frontend), and 8000(backend)
+import os
+
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins = ["http://localhost:3000","https://chapter1-menu-lppv.vercel.app","https://chapter1-frontend-lppv.vercel.app","https://chapter1-frontend-lppv-kkxr591h4-chapterone.vercel.app" ],             
+    allow_origins = ["http://localhost:3000","https://chapter1-menu-lppv.vercel.app"],             
     allow_methods=["*"],
     allow_headers=["*"])
+
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")
 
 @app.get("/menu")  #"Go to menu_items table, get everything, give it back to me."
 
@@ -76,3 +80,13 @@ def update_order_status(order_id: str, body: StatusUpdate):
 def get_orders():
     response = supabase.table("orders").select("*").execute()
     return response.data
+
+
+class PasswordCheck(BaseModel):
+    password: str
+
+@app.post("/verify-dashboard-password")
+def verify_dashboard_password(body: PasswordCheck):
+    if body.password == DASHBOARD_PASSWORD:
+        return {"valid": True}
+    return {"valid": False}
