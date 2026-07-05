@@ -30,6 +30,7 @@ class Order(BaseModel):
     customer_name : str
     customer_phone: str
     items : list[OrderItem]
+    payment_method: str = "cash"
 
 
 #when goes to orders tab 
@@ -39,12 +40,15 @@ def create_order(order: Order):
     for item in order.items:
         total = total + (item.price * item.quantity) 
 
+
     # Step 1 - save order header
     order_response = supabase.table("orders").insert({
         "customer_name": order.customer_name,
         "customer_phone": order.customer_phone,
         "total_amount": total,
-        "status": "received"
+        "status": "received",
+        "payment_method": order.payment_method,
+        "payment_status": "pending"
     }).execute()
 
     order_id = order_response.data[0]["id"]
@@ -90,3 +94,13 @@ def verify_dashboard_password(body: PasswordCheck):
     if body.password == DASHBOARD_PASSWORD:
         return {"valid": True}
     return {"valid": False}
+
+class PaymentConfirm(BaseModel):
+    payment_status: str
+
+@app.patch("/orders/{order_id}/payment")
+def confirm_payment(order_id: str, body: PaymentConfirm):
+    supabase.table('orders').update({
+        "payment_status": body.payment_status
+    }).eq("id", order_id).execute()
+    return {"message": "payment status updated"}
