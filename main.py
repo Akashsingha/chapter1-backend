@@ -62,9 +62,13 @@ def create_order(order: Order):
     }).execute()
 
     return {
+        "id": order_id,
         "customer_name": order.customer_name,
         "total": total,
-        "status": "received"
+        "total_amount": total,
+        "status": "received",
+        "payment_method": order.payment_method,
+        "payment_status": "pending"
     }
 
 class StatusUpdate(BaseModel):
@@ -79,6 +83,18 @@ def update_order_status(order_id: str, body: StatusUpdate):
     # where id = order_id
     # set status = new status
     return {"message": "order updated"}
+
+@app.get("/orders/{order_id}")
+def get_order(order_id: str):
+    response = supabase.table("orders").select("*").eq("id", order_id).execute()
+    if not response.data:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Order not found")
+    order = response.data[0]
+    # Fetch order items
+    items_response = supabase.table("order_items").select("*").eq("order_id", order_id).execute()
+    order["items"] = items_response.data
+    return order
 
 @app.get("/orders")
 def get_orders():
