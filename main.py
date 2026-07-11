@@ -130,8 +130,8 @@ class StatusUpdate(BaseModel):
     @field_validator("status")
     @classmethod
     def status_must_be_valid(cls, v):
-        if v not in ("received", "preparing", "ready"):
-            raise ValueError("Status must be 'received', 'preparing', or 'ready'")
+        if v not in ("received", "preparing", "ready", "completed"):
+            raise ValueError("Status must be 'received', 'preparing', 'ready', or 'completed'")
         return v
 
 
