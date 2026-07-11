@@ -57,7 +57,7 @@ def _cleanup_idempotency_cache():
 # ── Models with validation ────────────────────────────────
 
 class OrderItem(BaseModel):
-    id: Optional[int] = None   # used for server-side price lookup
+    id: Optional[str] = None   # UUID string — used for server-side price lookup
     name: str
     price: int
     quantity: int
@@ -193,7 +193,7 @@ def create_order(request: Request, order: Order):
     # ── Server-side price validation ──────────────────────
     # Fetch actual prices from DB — never trust client-sent prices
     item_ids = [item.id for item in order.items if item.id is not None]
-    menu_map: dict[int, dict] = {}
+    menu_map: dict[str, dict] = {}
     if item_ids:
         try:
             menu_resp = supabase.table("menu_items").select("id,name,price,is_available").in_("id", item_ids).execute()
@@ -416,7 +416,7 @@ def acknowledge_order(order_id: str, x_dashboard_key: str = Header(None)):
 
 
 @app.patch("/menu/{item_id}/availability")
-def toggle_menu_item_availability(item_id: int, x_dashboard_key: str = Header(None)):
+def toggle_menu_item_availability(item_id: str, x_dashboard_key: str = Header(None)):
     """Toggle a menu item between available and sold out. Requires dashboard key."""
     require_dashboard_key(x_dashboard_key)
 
