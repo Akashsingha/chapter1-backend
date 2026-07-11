@@ -229,6 +229,7 @@ def create_order(request: Request, order: Order):
         }).execute()
 
         order_id = order_response.data[0]["id"]
+        order_number = order_response.data[0].get("order_number")
 
         # ── Atomic batch insert for all order items ───────
         # Single DB call instead of a loop — reduces partial-data risk
@@ -246,6 +247,7 @@ def create_order(request: Request, order: Order):
 
         response_data = {
             "id": order_id,
+            "order_number": order_number,
             "customer_name": order.customer_name,
             "total": total,
             "total_amount": total,

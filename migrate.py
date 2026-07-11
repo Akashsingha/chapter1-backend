@@ -41,4 +41,14 @@ except Exception:
     print("  ⚠️  Could not verify via select. Please run this SQL manually in Supabase:")
     print("  ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS is_available BOOLEAN DEFAULT TRUE;")
 
+# ── Migration 3: order_number column on orders ────────────
+# Short, readable token number instead of UUID
+print("Running migration 3: adding 'order_number' column to orders...")
+try:
+    result = supabase.table("orders").select("order_number").limit(1).execute()
+    print("  ✅ Column 'order_number' already exists — skipping.")
+except Exception:
+    print("  ⚠️  Could not verify via select. Please run this SQL manually in Supabase:")
+    print("  ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_number SERIAL;")
+
 print("\nDone. If you saw any warnings above, run the SQL in Supabase dashboard → SQL Editor.")
