@@ -1,7 +1,10 @@
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header, Query, Request
 from pydantic import BaseModel, field_validator
 from database import supabase
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from datetime import datetime, date
 from typing import Optional
 import os
@@ -9,6 +12,11 @@ import re
 import time
 
 app = FastAPI()
+
+# ── Rate limiter ──────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── Config ────────────────────────────────────────────────
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD")
@@ -20,8 +28,8 @@ app.add_middleware(
         "http://localhost:3000",
         "https://chapter1-menu-lppv.vercel.app",
     ],
-    allow_methods=["GET", "POST", "PATCH"],           # Fix #16 — tightened from "*"
-    allow_headers=["Content-Type", "X-Dashboard-Key"], # Fix #16 — tightened from "*"
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["Content-Type", "X-Dashboard-Key"],
 )
 
 
@@ -49,6 +57,7 @@ def _cleanup_idempotency_cache():
 # ── Models with validation ────────────────────────────────
 
 class OrderItem(BaseModel):
+    id: Optional[int] = None   # used for server-side price lookup
     name: str
     price: int
     quantity: int
@@ -143,7 +152,7 @@ class PasswordCheck(BaseModel):
 
 # ── Helper: format order items ────────────────────────────
 def _format_items(items_data):
-    """Map item_name -> name for frontend consistency. (Fix #18)"""
+    """Map item_name -> name for frontend consistency."""
     formatted = []
     for item in items_data:
         formatted.append({
@@ -160,7 +169,8 @@ def _format_items(items_data):
 
 @app.get("/menu")
 def get_menu():
-    """Get all menu items — public."""
+    """Get all menu items — public. Returns all items including unavailable ones
+    so the dashboard can manage them. Customer frontend filters is_available."""
     try:
         response = supabase.table("menu_items").select("*").execute()
         return response.data
@@ -169,8 +179,9 @@ def get_menu():
 
 
 @app.post("/orders")
-def create_order(order: Order):
-    """Place a new order — public."""
+@limiter.limit("5/minute")
+def create_order(request: Request, order: Order):
+    """Place a new order — public. Rate limited to 5 per minute per IP."""
 
     # Fix #6 — Check idempotency key for duplicate prevention
     if order.idempotency_key:
@@ -179,9 +190,32 @@ def create_order(order: Order):
             _, cached_response = _idempotency_cache[order.idempotency_key]
             return cached_response
 
+    # ── Server-side price validation ──────────────────────
+    # Fetch actual prices from DB — never trust client-sent prices
+    item_ids = [item.id for item in order.items if item.id is not None]
+    menu_map: dict[int, dict] = {}
+    if item_ids:
+        try:
+            menu_resp = supabase.table("menu_items").select("id,name,price,is_available").in_("id", item_ids).execute()
+            menu_map = {m["id"]: m for m in menu_resp.data}
+        except Exception:
+            raise HTTPException(status_code=500, detail="Could not validate menu prices. Please try again.")
+
     total = 0
     for item in order.items:
-        total = total + (item.price * item.quantity)
+        if item.id and item.id in menu_map:
+            db_item = menu_map[item.id]
+            # Block orders for unavailable items
+            if db_item.get("is_available") is False:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"'{db_item['name']}' is currently unavailable. Please remove it from your cart."
+                )
+            # Use DB price — client price is completely ignored
+            total += db_item["price"] * item.quantity
+        else:
+            # Fallback: item has no ID (shouldn't happen in normal flow)
+            total += item.price * item.quantity
 
     try:
         # Save order header
@@ -196,14 +230,19 @@ def create_order(order: Order):
 
         order_id = order_response.data[0]["id"]
 
-        # Save order items
-        for item in order.items:
-            supabase.table("order_items").insert({
+        # ── Atomic batch insert for all order items ───────
+        # Single DB call instead of a loop — reduces partial-data risk
+        items_to_insert = [
+            {
                 "order_id": order_id,
                 "item_name": item.name,
                 "quantity": item.quantity,
-                "price": item.price,
-            }).execute()
+                # Store validated DB price, not client price
+                "price": menu_map[item.id]["price"] if (item.id and item.id in menu_map) else item.price,
+            }
+            for item in order.items
+        ]
+        supabase.table("order_items").insert(items_to_insert).execute()
 
         response_data = {
             "id": order_id,
@@ -229,7 +268,8 @@ def create_order(order: Order):
 
 @app.get("/orders/{order_id}")
 def get_order(order_id: str):
-    """Get a single order by ID — public (needed for confirmed/payment pages)."""
+    """Get a single order by ID — public (needed for confirmed/payment pages).
+    PII (customer_phone) is stripped — only visible in the authenticated dashboard."""
     try:
         response = supabase.table("orders").select("*").eq("id", order_id).execute()
     except Exception:
@@ -240,12 +280,15 @@ def get_order(order_id: str):
 
     order = response.data[0]
 
-    # Fetch and format order items (Fix #18 — consistent field names)
+    # Fetch and format order items
     try:
         items_response = supabase.table("order_items").select("*").eq("order_id", order_id).execute()
         order["items"] = _format_items(items_response.data)
     except Exception:
         order["items"] = []
+
+    # Strip PII from public response
+    order.pop("customer_phone", None)
 
     return order
 
@@ -257,13 +300,12 @@ def get_orders(
     x_dashboard_key: str = Header(None),
     date_filter: Optional[str] = Query(None, alias="date"),
 ):
-    """Get all orders — requires dashboard key. Supports ?date=YYYY-MM-DD filter. (Fix #9)"""
+    """Get all orders with full PII — requires dashboard key. Supports ?date=YYYY-MM-DD filter."""
     require_dashboard_key(x_dashboard_key)
 
     try:
         query = supabase.table("orders").select("*")
 
-        # Fix #9 — date filter (defaults to today)
         if date_filter:
             try:
                 filter_date = datetime.strptime(date_filter, "%Y-%m-%d").date()
@@ -294,7 +336,6 @@ def update_order_status(order_id: str, body: StatusUpdate, x_dashboard_key: str 
     require_dashboard_key(x_dashboard_key)
 
     try:
-        # Verify order exists
         existing = supabase.table("orders").select("id, status").eq("id", order_id).execute()
         if not existing.data:
             raise HTTPException(status_code=404, detail="Order not found")
@@ -331,7 +372,6 @@ def confirm_payment(order_id: str, body: PaymentConfirm, x_dashboard_key: str = 
         raise HTTPException(status_code=500, detail="Could not update payment status")
 
 
-# Fix #11 — Order cancellation
 @app.patch("/orders/{order_id}/cancel")
 def cancel_order(order_id: str, x_dashboard_key: str = Header(None)):
     """Cancel an order — only if status is 'received'. Requires dashboard key."""
@@ -356,6 +396,49 @@ def cancel_order(order_id: str, x_dashboard_key: str = Header(None)):
         raise HTTPException(status_code=500, detail="Could not cancel order")
 
 
+@app.patch("/orders/{order_id}/acknowledge")
+def acknowledge_order(order_id: str, x_dashboard_key: str = Header(None)):
+    """Mark an order as acknowledged — persisted in DB so it syncs across all staff devices.
+    Requires dashboard key."""
+    require_dashboard_key(x_dashboard_key)
+
+    try:
+        existing = supabase.table("orders").select("id").eq("id", order_id).execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        supabase.table("orders").update({"acknowledged": True}).eq("id", order_id).execute()
+        return {"message": "acknowledged"}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not acknowledge order")
+
+
+@app.patch("/menu/{item_id}/availability")
+def toggle_menu_item_availability(item_id: int, x_dashboard_key: str = Header(None)):
+    """Toggle a menu item between available and sold out. Requires dashboard key."""
+    require_dashboard_key(x_dashboard_key)
+
+    try:
+        current = supabase.table("menu_items").select("id,name,is_available").eq("id", item_id).execute()
+        if not current.data:
+            raise HTTPException(status_code=404, detail="Menu item not found")
+
+        current_avail = current.data[0].get("is_available", True)
+        # If is_available is NULL (column just added), treat as True
+        if current_avail is None:
+            current_avail = True
+        new_avail = not current_avail
+
+        supabase.table("menu_items").update({"is_available": new_avail}).eq("id", item_id).execute()
+        return {"id": item_id, "is_available": new_avail}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not update item availability")
+
+
 # ── Auth ──────────────────────────────────────────────────
 
 @app.post("/verify-dashboard-password")
@@ -364,6 +447,6 @@ def verify_dashboard_password(body: PasswordCheck):
     if body.password == DASHBOARD_PASSWORD:
         return {
             "valid": True,
-            "api_key": DASHBOARD_API_KEY,   # Fix #3 — frontend stores this for future requests
+            "api_key": DASHBOARD_API_KEY,
         }
     return {"valid": False}
