@@ -146,6 +146,32 @@ class PaymentConfirm(BaseModel):
         return v
 
 
+class InventoryRestock(BaseModel):
+    item_id: str
+    added_amount: float
+
+    @field_validator("added_amount")
+    @classmethod
+    def amount_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError("Restock amount must be positive")
+        return v
+
+
+class RecipeLink(BaseModel):
+    menu_item_id: str
+    inventory_item_id: str
+    quantity_required: float
+
+    @field_validator("quantity_required")
+    @classmethod
+    def quantity_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError("Quantity required must be positive")
+        return v
+
+
+
 class PasswordCheck(BaseModel):
     password: str
 
@@ -161,8 +187,57 @@ def _format_items(items_data):
             "quantity": item.get("quantity", 0),
             "order_id": item.get("order_id"),
             "id": item.get("id"),
+            "menu_item_id": item.get("menu_item_id") # Needed for inventory deduction
         })
     return formatted
+
+# ── Helper: Deduct Inventory ──────────────────────────────
+def _deduct_inventory_for_order(order_id: str):
+    """Deduct stock based on recipe definitions."""
+    try:
+        # 1. Fetch order items
+        order_items = supabase.table("order_items").select("*").eq("order_id", order_id).execute()
+        if not order_items.data:
+            return
+            
+        # Group by menu_item_id and sum quantities (in case of duplicate lines)
+        item_qty = {}
+        for item in order_items.data:
+            menu_id = item.get("menu_item_id")
+            if menu_id:
+                item_qty[menu_id] = item_qty.get(menu_id, 0) + item.get("quantity", 1)
+                
+        if not item_qty:
+            return
+            
+        # 2. Fetch recipes for these menu items
+        recipes = supabase.table("recipe_ingredients").select("*").in_("menu_item_id", list(item_qty.keys())).execute()
+        if not recipes.data:
+            return
+            
+        # 3. Calculate total deductions per inventory item
+        deductions = {}
+        for recipe in recipes.data:
+            inv_id = recipe["inventory_item_id"]
+            menu_id = recipe["menu_item_id"]
+            req_qty = recipe["quantity_required"]
+            
+            ordered_qty = item_qty.get(menu_id, 0)
+            deductions[inv_id] = deductions.get(inv_id, 0) + (req_qty * ordered_qty)
+            
+        # 4. Fetch current stock and update
+        if deductions:
+            inv_items = supabase.table("inventory_items").select("id, current_stock").in_("id", list(deductions.keys())).execute()
+            for inv in inv_items.data:
+                inv_id = inv["id"]
+                current_stock = inv["current_stock"] or 0
+                new_stock = current_stock - deductions.get(inv_id, 0)
+                # Deduct stock (it can go negative, which indicates we missed logging a restock)
+                supabase.table("inventory_items").update({"current_stock": new_stock}).eq("id", inv_id).execute()
+                
+    except Exception as e:
+        print(f"Error deducting inventory for {order_id}: {e}")
+
 
 
 # ── Public endpoints ──────────────────────────────────────
@@ -236,6 +311,7 @@ def create_order(request: Request, order: Order):
         items_to_insert = [
             {
                 "order_id": order_id,
+                "menu_item_id": item.id, # Save menu_item_id for inventory lookup
                 "item_name": item.name,
                 "quantity": item.quantity,
                 # Store validated DB price, not client price
@@ -359,13 +435,19 @@ def confirm_payment(order_id: str, body: PaymentConfirm, x_dashboard_key: str = 
     require_dashboard_key(x_dashboard_key)
 
     try:
-        existing = supabase.table("orders").select("id").eq("id", order_id).execute()
+        existing = supabase.table("orders").select("id, payment_status").eq("id", order_id).execute()
         if not existing.data:
             raise HTTPException(status_code=404, detail="Order not found")
+            
+        current_status = existing.data[0].get("payment_status")
 
         supabase.table("orders").update({
             "payment_status": body.payment_status
         }).eq("id", order_id).execute()
+        
+        # Deduct inventory if status changed to confirmed
+        if current_status != "confirmed" and body.payment_status == "confirmed":
+            _deduct_inventory_for_order(order_id)
 
         return {"message": "payment status updated"}
     except HTTPException:
@@ -439,6 +521,71 @@ def toggle_menu_item_availability(item_id: str, x_dashboard_key: str = Header(No
         raise
     except Exception:
         raise HTTPException(status_code=500, detail="Could not update item availability")
+
+
+# ── Inventory Endpoints (Requires Dashboard Key) ────────
+@app.get("/inventory")
+def get_inventory(x_dashboard_key: str = Header(None)):
+    """Get all inventory items."""
+    require_dashboard_key(x_dashboard_key)
+    try:
+        response = supabase.table("inventory_items").select("*").order("name").execute()
+        return response.data
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not fetch inventory")
+
+@app.post("/inventory/restock")
+def restock_inventory(body: InventoryRestock, x_dashboard_key: str = Header(None)):
+    """Add stock to an inventory item."""
+    require_dashboard_key(x_dashboard_key)
+    try:
+        existing = supabase.table("inventory_items").select("id, current_stock").eq("id", body.item_id).execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Inventory item not found")
+            
+        current = existing.data[0].get("current_stock") or 0
+        new_stock = current + body.added_amount
+        
+        supabase.table("inventory_items").update({"current_stock": new_stock}).eq("id", body.item_id).execute()
+        return {"message": "Restocked successfully", "new_stock": new_stock}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not restock inventory")
+
+@app.get("/recipes")
+def get_recipes(x_dashboard_key: str = Header(None)):
+    """Get all mapped recipes."""
+    require_dashboard_key(x_dashboard_key)
+    try:
+        # Return a join with menu item name and inventory item name
+        response = supabase.table("recipe_ingredients").select("*, menu_items(name), inventory_items(name, unit)").execute()
+        return response.data
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not fetch recipes")
+
+@app.post("/recipes/link")
+def link_recipe(body: RecipeLink, x_dashboard_key: str = Header(None)):
+    """Map a menu item to an inventory item."""
+    require_dashboard_key(x_dashboard_key)
+    try:
+        # Check if link already exists
+        existing = supabase.table("recipe_ingredients").select("id").eq("menu_item_id", body.menu_item_id).eq("inventory_item_id", body.inventory_item_id).execute()
+        
+        if existing.data:
+            # Update
+            supabase.table("recipe_ingredients").update({"quantity_required": body.quantity_required}).eq("id", existing.data[0]["id"]).execute()
+        else:
+            # Insert
+            supabase.table("recipe_ingredients").insert({
+                "menu_item_id": body.menu_item_id,
+                "inventory_item_id": body.inventory_item_id,
+                "quantity_required": body.quantity_required
+            }).execute()
+            
+        return {"message": "Recipe mapped successfully"}
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not link recipe")
 
 
 # ── Auth ──────────────────────────────────────────────────
