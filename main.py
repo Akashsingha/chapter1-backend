@@ -171,6 +171,19 @@ class RecipeLink(BaseModel):
         return v
 
 
+class ExpenseCreate(BaseModel):
+    amount: float
+    category: str
+    description: str
+    date_logged: str
+
+    @field_validator("amount")
+    @classmethod
+    def amount_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError("Expense amount must be positive")
+        return v
+
 
 class PasswordCheck(BaseModel):
     password: str
@@ -659,6 +672,80 @@ def get_analytics(days: int = 7, x_dashboard_key: str = Header(None)):
     except Exception as e:
         print(f"Analytics error: {e}")
         raise HTTPException(status_code=500, detail="Could not fetch analytics")
+
+# ── Accounting Endpoints (Requires Dashboard Key) ─────────
+
+@app.get("/expenses")
+def get_expenses(month: str = None, x_dashboard_key: str = Header(None)):
+    """Fetch all expenses, optionally filtered by YYYY-MM."""
+    require_dashboard_key(x_dashboard_key)
+    try:
+        query = supabase.table("expenses").select("*").order("date_logged", desc=True)
+        if month:
+            start_str = f"{month}-01T00:00:00"
+            # very simplified end of month logic for MVP
+            end_str = f"{month}-31T23:59:59" 
+            query = query.gte("date_logged", start_str).lte("date_logged", end_str)
+            
+        resp = query.execute()
+        return resp.data
+    except Exception as e:
+        print(f"Fetch expenses error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch expenses")
+
+@app.post("/expenses")
+def log_expense(body: ExpenseCreate, x_dashboard_key: str = Header(None)):
+    """Log a new expense."""
+    require_dashboard_key(x_dashboard_key)
+    try:
+        supabase.table("expenses").insert({
+            "amount": body.amount,
+            "category": body.category,
+            "description": body.description,
+            "date_logged": body.date_logged
+        }).execute()
+        return {"message": "Expense logged successfully"}
+    except Exception as e:
+        print(f"Log expense error: {e}")
+        raise HTTPException(status_code=500, detail="Could not log expense")
+
+@app.get("/accounting/summary")
+def get_accounting_summary(month: str = Query(...), x_dashboard_key: str = Header(None)):
+    """Calculate Profit & Loss for a given YYYY-MM month."""
+    require_dashboard_key(x_dashboard_key)
+    try:
+        start_str = f"{month}-01T00:00:00"
+        end_str = f"{month}-31T23:59:59"
+        
+        # 1. Calculate Revenue (completed & confirmed only)
+        # Note: We count orders that are not cancelled
+        orders_resp = supabase.table("orders").select("total_amount").neq("status", "cancelled").gte("created_at", start_str).lte("created_at", end_str).execute()
+        orders = orders_resp.data or []
+        total_revenue = sum(o.get("total_amount", 0) for o in orders) / 100.0  # Convert to INR
+        
+        # 2. Calculate Expenses
+        exp_resp = supabase.table("expenses").select("amount, category").gte("date_logged", start_str).lte("date_logged", end_str).execute()
+        expenses = exp_resp.data or []
+        total_expenses = sum(e.get("amount", 0) for e in expenses)
+        
+        # 3. Categorized Expenses Breakdown
+        categories = {}
+        for e in expenses:
+            cat = e.get("category", "other")
+            categories[cat] = categories.get(cat, 0) + e.get("amount", 0)
+            
+        net_profit = total_revenue - total_expenses
+        
+        return {
+            "total_revenue": total_revenue,
+            "total_expenses": total_expenses,
+            "net_profit": net_profit,
+            "expense_breakdown": categories
+        }
+    except Exception as e:
+        print(f"Accounting summary error: {e}")
+        raise HTTPException(status_code=500, detail="Could not calculate summary")
+
 
 # ── Auth ──────────────────────────────────────────────────
 
