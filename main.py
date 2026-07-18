@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 import os
 import re
@@ -587,6 +587,78 @@ def link_recipe(body: RecipeLink, x_dashboard_key: str = Header(None)):
     except Exception:
         raise HTTPException(status_code=500, detail="Could not link recipe")
 
+
+@app.get("/analytics")
+def get_analytics(days: int = 7, x_dashboard_key: str = Header(None)):
+    """Fetch aggregated analytics for the given number of days."""
+    require_dashboard_key(x_dashboard_key)
+    try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+        start_str = start_date.strftime("%Y-%m-%dT00:00:00")
+        
+        # 1. Fetch Orders (Exclude cancelled)
+        orders_resp = supabase.table("orders").select("id, total_amount, created_at").neq("status", "cancelled").gte("created_at", start_str).order("created_at").execute()
+        orders = orders_resp.data or []
+        
+        total_revenue = sum(o.get("total_amount", 0) for o in orders)
+        total_orders = len(orders)
+        
+        # 2. Groupings
+        revenue_by_day = {}
+        peak_hours = {}
+        order_ids = []
+        
+        for o in orders:
+            order_ids.append(o["id"])
+            
+            # Ensure proper timestamp parsing
+            ts_str = o["created_at"].replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts_str)
+            
+            day_str = dt.strftime("%b %d") # e.g. Jul 12
+            revenue_by_day[day_str] = revenue_by_day.get(day_str, 0) + o.get("total_amount", 0)
+            
+            hour_str = dt.strftime("%I %p") # e.g. 02 PM
+            peak_hours[hour_str] = peak_hours.get(hour_str, 0) + 1
+            
+        revenue_chart = [{"date": k, "revenue": v / 100} for k, v in revenue_by_day.items()]
+        
+        # Sort peak hours nicely (01 AM -> 12 PM)
+        # We can just return it and let frontend handle it, or sort it here.
+        peak_chart = [{"hour": k, "orders": v} for k, v in peak_hours.items()]
+        
+        # 3. Best Sellers
+        best_sellers = []
+        if order_ids:
+            # We batch in 100s to avoid Supabase URL length limits
+            items = []
+            chunk_size = 100
+            for i in range(0, len(order_ids), chunk_size):
+                chunk = order_ids[i:i + chunk_size]
+                items_resp = supabase.table("order_items").select("item_name, quantity").in_("order_id", chunk).execute()
+                if items_resp.data:
+                    items.extend(items_resp.data)
+            
+            item_counts = {}
+            for item in items:
+                name = item.get("item_name")
+                qty = item.get("quantity", 1)
+                item_counts[name] = item_counts.get(name, 0) + qty
+                
+            sorted_items = sorted(item_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+            best_sellers = [{"name": k, "quantity": v} for k, v in sorted_items]
+            
+        return {
+            "total_revenue": total_revenue / 100,
+            "total_orders": total_orders,
+            "revenue_by_day": revenue_chart,
+            "peak_hours": peak_chart,
+            "best_sellers": best_sellers
+        }
+    except Exception as e:
+        print(f"Analytics error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch analytics")
 
 # ── Auth ──────────────────────────────────────────────────
 
