@@ -34,10 +34,15 @@ app.add_middleware(
 
 
 # ── Auth helper ───────────────────────────────────────────
-def require_dashboard_key(x_dashboard_key: str = Header(None)):
-    """Verify the X-Dashboard-Key header matches our secret."""
-    if not x_dashboard_key or x_dashboard_key != DASHBOARD_API_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden — invalid or missing dashboard key")
+def require_dashboard_key(key: str, admin_only: bool = False):
+    if not key:
+        raise HTTPException(status_code=401, detail="Missing dashboard key")
+    if admin_only:
+        if key != ADMIN_PASSWORD:
+            raise HTTPException(status_code=403, detail="Admin access required")
+    else:
+        if key not in [ADMIN_PASSWORD, STAFF_PASSWORD]:
+            raise HTTPException(status_code=403, detail="Invalid dashboard key")
 
 
 # ── Idempotency cache (in-memory, simple) ─────────────────
@@ -184,6 +189,8 @@ class ExpenseCreate(BaseModel):
             raise ValueError("Expense amount must be positive")
         return v
 
+class WaiterCall(BaseModel):
+    table_number: str
 
 class PasswordCheck(BaseModel):
     password: str
@@ -515,7 +522,7 @@ def acknowledge_order(order_id: str, x_dashboard_key: str = Header(None)):
 @app.patch("/menu/{item_id}/availability")
 def toggle_menu_item_availability(item_id: str, x_dashboard_key: str = Header(None)):
     """Toggle a menu item between available and sold out. Requires dashboard key."""
-    require_dashboard_key(x_dashboard_key)
+    require_dashboard_key(x_dashboard_key, admin_only=True)
 
     try:
         current = supabase.table("menu_items").select("id,name,is_available").eq("id", item_id).execute()
@@ -540,7 +547,7 @@ def toggle_menu_item_availability(item_id: str, x_dashboard_key: str = Header(No
 @app.get("/inventory")
 def get_inventory(x_dashboard_key: str = Header(None)):
     """Get all inventory items."""
-    require_dashboard_key(x_dashboard_key)
+    require_dashboard_key(x_dashboard_key, admin_only=True)
     try:
         response = supabase.table("inventory_items").select("*").order("name").execute()
         return response.data
@@ -550,7 +557,7 @@ def get_inventory(x_dashboard_key: str = Header(None)):
 @app.post("/inventory/restock")
 def restock_inventory(body: InventoryRestock, x_dashboard_key: str = Header(None)):
     """Add stock to an inventory item."""
-    require_dashboard_key(x_dashboard_key)
+    require_dashboard_key(x_dashboard_key, admin_only=True)
     try:
         existing = supabase.table("inventory_items").select("id, current_stock").eq("id", body.item_id).execute()
         if not existing.data:
@@ -569,7 +576,7 @@ def restock_inventory(body: InventoryRestock, x_dashboard_key: str = Header(None
 @app.get("/recipes")
 def get_recipes(x_dashboard_key: str = Header(None)):
     """Get all mapped recipes."""
-    require_dashboard_key(x_dashboard_key)
+    require_dashboard_key(x_dashboard_key, admin_only=True)
     try:
         # Return a join with menu item name and inventory item name
         response = supabase.table("recipe_ingredients").select("*, menu_items(name), inventory_items(name, unit)").execute()
@@ -580,7 +587,7 @@ def get_recipes(x_dashboard_key: str = Header(None)):
 @app.post("/recipes/link")
 def link_recipe(body: RecipeLink, x_dashboard_key: str = Header(None)):
     """Map a menu item to an inventory item."""
-    require_dashboard_key(x_dashboard_key)
+    require_dashboard_key(x_dashboard_key, admin_only=True)
     try:
         # Check if link already exists
         existing = supabase.table("recipe_ingredients").select("id").eq("menu_item_id", body.menu_item_id).eq("inventory_item_id", body.inventory_item_id).execute()
@@ -604,7 +611,7 @@ def link_recipe(body: RecipeLink, x_dashboard_key: str = Header(None)):
 @app.get("/analytics")
 def get_analytics(days: int = 7, x_dashboard_key: str = Header(None)):
     """Fetch aggregated analytics for the given number of days."""
-    require_dashboard_key(x_dashboard_key)
+    require_dashboard_key(x_dashboard_key, admin_only=True)
     try:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
@@ -673,12 +680,12 @@ def get_analytics(days: int = 7, x_dashboard_key: str = Header(None)):
         print(f"Analytics error: {e}")
         raise HTTPException(status_code=500, detail="Could not fetch analytics")
 
-# ── Accounting Endpoints (Requires Dashboard Key) ─────────
+# ── Accounting Endpoints (Admin Only) ─────────
 
 @app.get("/expenses")
 def get_expenses(month: str = None, x_dashboard_key: str = Header(None)):
     """Fetch all expenses, optionally filtered by YYYY-MM."""
-    require_dashboard_key(x_dashboard_key)
+    require_dashboard_key(x_dashboard_key, admin_only=True)
     try:
         query = supabase.table("expenses").select("*").order("date_logged", desc=True)
         if month:
@@ -696,7 +703,7 @@ def get_expenses(month: str = None, x_dashboard_key: str = Header(None)):
 @app.post("/expenses")
 def log_expense(body: ExpenseCreate, x_dashboard_key: str = Header(None)):
     """Log a new expense."""
-    require_dashboard_key(x_dashboard_key)
+    require_dashboard_key(x_dashboard_key, admin_only=True)
     try:
         supabase.table("expenses").insert({
             "amount": body.amount,
@@ -712,7 +719,7 @@ def log_expense(body: ExpenseCreate, x_dashboard_key: str = Header(None)):
 @app.get("/accounting/summary")
 def get_accounting_summary(month: str = Query(...), x_dashboard_key: str = Header(None)):
     """Calculate Profit & Loss for a given YYYY-MM month."""
-    require_dashboard_key(x_dashboard_key)
+    require_dashboard_key(x_dashboard_key, admin_only=True)
     try:
         start_str = f"{month}-01T00:00:00"
         end_str = f"{month}-31T23:59:59"
@@ -751,10 +758,43 @@ def get_accounting_summary(month: str = Query(...), x_dashboard_key: str = Heade
 
 @app.post("/verify-dashboard-password")
 def verify_dashboard_password(body: PasswordCheck):
-    """Verify dashboard password and return API key on success."""
-    if body.password == DASHBOARD_PASSWORD:
-        return {
-            "valid": True,
-            "api_key": DASHBOARD_API_KEY,
-        }
-    return {"valid": False}
+    if body.password == ADMIN_PASSWORD:
+        return {"success": True, "role": "admin"}
+    elif body.password == STAFF_PASSWORD:
+        return {"success": True, "role": "staff"}
+    else:
+        raise HTTPException(status_code=401, detail="Incorrect password")
+
+# ── Waiter Call ───────────────────────────────────────────
+
+@app.post("/call-waiter")
+def call_waiter(body: WaiterCall):
+    try:
+        supabase.table("waiter_calls").insert({
+            "table_number": body.table_number,
+            "status": "pending"
+        }).execute()
+        return {"message": "Waiter called successfully"}
+    except Exception as e:
+        print(f"Call waiter error: {e}")
+        raise HTTPException(status_code=500, detail="Could not call waiter")
+
+@app.get("/waiter-calls")
+def get_waiter_calls(x_dashboard_key: str = Header(None)):
+    require_dashboard_key(x_dashboard_key)
+    try:
+        resp = supabase.table("waiter_calls").select("*").eq("status", "pending").order("created_at").execute()
+        return resp.data or []
+    except Exception as e:
+        print(f"Get waiter calls error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch waiter calls")
+
+@app.patch("/waiter-calls/{call_id}/resolve")
+def resolve_waiter_call(call_id: str, x_dashboard_key: str = Header(None)):
+    require_dashboard_key(x_dashboard_key)
+    try:
+        supabase.table("waiter_calls").update({"status": "resolved"}).eq("id", call_id).execute()
+        return {"message": "Call resolved"}
+    except Exception as e:
+        print(f"Resolve waiter error: {e}")
+        raise HTTPException(status_code=500, detail="Could not resolve waiter call")
